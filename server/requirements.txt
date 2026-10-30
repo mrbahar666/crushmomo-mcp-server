@@ -1,0 +1,2 @@
+# No pip dependencies. Python 3.12 standard library only (http.server, sqlite3, subprocess, hashlib).
+# This file exists only so a reviewer can see, at a glance, that nothing is pinned from PyPI.
