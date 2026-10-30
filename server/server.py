@@ -25,9 +25,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlencode
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 SERVER_NAME = "crushmomo-mcp"
 PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 DHAKA = timezone(timedelta(hours=6))
@@ -90,16 +90,8 @@ def mask_value(v):
     return s
 
 def mask_params(params):
-    out = {}
-    for k, v in (params or {}).items():
-        kl = str(k).lower()
-        if "phone" in kl or "email" in kl or "token" in kl or "pin" in kl or "password" in kl:
-            out[k] = "***" if v is not None else None
-        elif isinstance(v, str):
-            out[k] = mask_value(v)
-        else:
-            out[k] = v
-    return out
+    # Free-text searches and nested/unknown arguments can contain credentials or PII.
+    return {"redacted": True} if params else {}
 
 def clamp_int(v, default, lo, hi):
     try:
@@ -196,7 +188,7 @@ def log_call(token_name, tool, params, row_count, ip, ok, error=""):
             db = state_db()
             db.execute("INSERT INTO call_log (ts, token_name, tool, params, row_count, ip, ok, error) VALUES (?,?,?,?,?,?,?,?)",
                        (datetime.now(timezone.utc).isoformat(), token_name, tool,
-                        json.dumps(mask_params(params)), int(row_count), ip, 1 if ok else 0, (error or "")[:200]))
+                        json.dumps(mask_params(params)), int(row_count), ip, 1 if ok else 0, "tool failed" if error else ""))
             db.commit()
     except Exception:
         pass
@@ -220,19 +212,36 @@ def verify_bearer(token):
             return ("token", row[0])
         row = db.execute("SELECT kind, client_id, expires_at, revoked FROM oauth_tokens WHERE token_hash=?", (h,)).fetchone()
         if row:
-            if row[3]:
+            if row[0] != "access" or row[3]:
                 return None
             if row[2] and datetime.now(timezone.utc).isoformat() > row[2]:
                 return None
             # v1.0.2: if this OAuth client was approved with an admin token,
             # a revoked/expired admin token also kills the OAuth tokens.
-            link = db.execute("SELECT admin_token_id FROM oauth_links WHERE client_id=?", (row[1],)).fetchone()
-            if link:
-                trow = db.execute("SELECT expires_at, revoked FROM tokens WHERE id=?", (link[0],)).fetchone()
-                if not trow or trow[1] or (trow[0] and datetime.now(timezone.utc).isoformat() > trow[0]):
-                    return None
+            link = oauth_link(db, h, row[1])
+            if not linked_token_active(db, link):
+                return None
             return ("oauth", "oauth:" + row[1])
     return None
+
+def oauth_link(db, token_hash, client_id):
+    # New links use token hashes; retain client-keyed links for existing grants.
+    return (db.execute("SELECT admin_token_id FROM oauth_links WHERE client_id=?", (token_hash,)).fetchone()
+            or db.execute("SELECT admin_token_id FROM oauth_links WHERE client_id=?", (client_id,)).fetchone())
+
+def linked_token_active(db, link):
+    if not link or link[0] is None:
+        return True
+    row = db.execute("SELECT expires_at, revoked FROM tokens WHERE id=?", (link[0],)).fetchone()
+    return bool(row and not row[1] and (not row[0] or datetime.now(timezone.utc).isoformat() <= row[0]))
+
+def valid_authorization(cid, redir, challenge, method):
+    with _lock:
+        row = state_db().execute("SELECT redirect_uris FROM oauth_clients WHERE client_id=?", (cid,)).fetchone()
+    # Trailing-slash normalised: ChatGPT may send a slash variant of its
+    # registered redirect; rejecting it would regress the ChatGPT flow.
+    return bool(row and redir.rstrip("/") in [u.rstrip("/") for u in json.loads(row[0])] and method == "S256"
+                and re.fullmatch(r"[A-Za-z0-9_-]{43,128}", challenge))
 
 # rate limiting (in-memory, per token/IP)
 _rate = {}
@@ -706,7 +715,8 @@ def send_json(handler, code, obj, extra=None):
         for k, v in extra.items():
             handler.send_header(k, v)
     handler.end_headers()
-    handler.wfile.write(data)
+    if handler.command != "HEAD":
+        handler.wfile.write(data)
 
 def send_html(handler, code, body, cookie=None):
     data = body.encode()
@@ -717,7 +727,8 @@ def send_html(handler, code, body, cookie=None):
     if cookie:
         handler.send_header("Set-Cookie", cookie)
     handler.end_headers()
-    handler.wfile.write(data)
+    if handler.command != "HEAD":
+        handler.wfile.write(data)
 
 def bearer_of(handler):
     auth = handler.headers.get("Authorization") or ""
@@ -727,7 +738,7 @@ def bearer_of(handler):
 
 def session_ok(handler):
     cookie = handler.headers.get("Cookie") or ""
-    m = re.search(r"cmcp_session=([A-Za-z0-9_\-]+)", cookie)
+    m = re.search(r"(?:^|;\s*)cmcp_session=([A-Za-z0-9_\-]+)", cookie)
     if not m:
         return False
     h = sha256_hex(m.group(1))
@@ -764,25 +775,33 @@ def clear_failed_login(ip):
         db.commit()
 
 ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Crush Momo MCP — Admin</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2em auto;padding:0 1em}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px;text-align:left;font-size:14px}input,button{padding:8px;margin:4px 0}</style></head>
+<title>Crush Momo MCP — Admin</title><style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#111;background:#fff}#tokens,#logs{overflow-x:auto}input,button{font:inherit;min-height:44px;max-width:100%;box-sizing:border-box}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px;text-align:left;font-size:14px}input,button{padding:8px;margin:4px 0}</style></head>
 <body><h1>Crush Momo MCP — Admin</h1><p>This admin is separate from the WordPress admin. It manages MCP tokens and call logs only. It never shows a token value after creation, and logs never show full phone/email.</p>
-<div id="login"><h2>Login</h2><input id="pin" type="password" placeholder="Admin PIN"><button onclick="login()">Login</button><p id="msg"></p></div>
+<form id="login" onsubmit="event.preventDefault();login()"><h2>Login</h2><label for="pin">Admin PIN</label><input id="pin" name="pin" type="password" autocomplete="current-password"><button type="submit">Login</button></form><p id="msg" role="status"></p>
 <div id="app" style="display:none"><button onclick="logout()">Logout</button>
-<h2>New token</h2><input id="tname" placeholder="Client name, e.g. Claude"><input id="texp" type="number" value="365" style="width:80px"> days <button onclick="newToken()">Generate</button><p id="newtok" style="word-break:break-all"></p>
+<h2>New token</h2><label for="tname">Client name</label><input id="tname" maxlength="80" placeholder="e.g. ChatGPT"><label for="texp">Expiry (days)</label><input id="texp" type="number" min="1" max="3650" value="365" style="width:80px"> <button onclick="newToken()">Generate</button><p id="newtok" role="status" style="word-break:break-all"></p>
 <h2>Tokens</h2><div id="tokens"></div>
 <h2>Call log (latest 100)</h2><div id="logs"></div></div>
 <script>
-async function api(p,m,b){const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});return r.json();}
-async function login(){const r=await api('/admin/api/login','POST',{pin:document.getElementById('pin').value});document.getElementById('msg').textContent=r.ok?'Logged in':'Login failed';if(r.ok){show();}}
+function safe(v){const el=document.createElement('span');el.textContent=String(v??'');return el.innerHTML;}
+async function api(p,m,b){try{const r=await fetch(p,{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});const data=await r.json();if(!r.ok){if(r.status===401){document.getElementById('login').style.display='block';document.getElementById('app').style.display='none';document.getElementById('newtok').textContent='';}throw new Error(data.error||'Request failed');}return data;}catch(e){document.getElementById('msg').textContent=e.message;return {error:e.message};}}
+async function login(){const r=await api('/admin/api/login','POST',{pin:document.getElementById('pin').value});document.getElementById('msg').textContent=r.ok?'Logged in':(r.error||document.getElementById('msg').textContent||'Login failed');if(r.ok){document.getElementById('pin').value='';show();}}
 async function logout(){await api('/admin/api/logout','POST',{});location.reload();}
-async function show(){document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';const t=await api('/admin/api/tokens','GET');document.getElementById('tokens').innerHTML='<table><tr><th>Name</th><th>Created</th><th>Expires</th><th>Last used</th><th>Action</th></tr>'+t.tokens.map(x=>'<tr><td>'+x.name+'</td><td>'+x.created_at+'</td><td>'+x.expires_at+'</td><td>'+(x.last_used_at||'')+'</td><td>'+(x.revoked?'revoked':'<button onclick="revoke('+x.id+')">Revoke</button>')+'</td></tr>').join('')+'</table>';const l=await api('/admin/api/logs','GET');document.getElementById('logs').innerHTML='<table><tr><th>Time (UTC)</th><th>Token</th><th>Tool</th><th>Rows</th><th>IP</th><th>OK</th></tr>'+l.logs.map(x=>'<tr><td>'+x.ts+'</td><td>'+x.token_name+'</td><td>'+x.tool+'</td><td>'+x.row_count+'</td><td>'+x.ip+'</td><td>'+x.ok+'</td></tr>').join('')+'</table>';}
+async function show(){document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';const t=await api('/admin/api/tokens','GET');if(!t.tokens)return;document.getElementById('tokens').innerHTML='<table><tr><th>Name</th><th>Created</th><th>Expires</th><th>Last used</th><th>Action</th></tr>'+t.tokens.map(x=>'<tr><td>'+safe(x.name)+'</td><td>'+safe(x.created_at)+'</td><td>'+safe(x.expires_at)+'</td><td>'+safe(x.last_used_at||'')+'</td><td>'+(x.revoked?'revoked':Date.parse(x.expires_at)<=Date.now()?'expired':'<button onclick="revoke('+x.id+')">Revoke</button>')+'</td></tr>').join('')+'</table>';const l=await api('/admin/api/logs','GET');if(!l.logs)return;document.getElementById('logs').innerHTML='<table><tr><th>Time (UTC)</th><th>Token</th><th>Tool</th><th>Rows</th><th>IP</th><th>OK</th></tr>'+l.logs.map(x=>'<tr><td>'+safe(x.ts)+'</td><td>'+safe(x.token_name)+'</td><td>'+safe(x.tool)+'</td><td>'+safe(x.row_count)+'</td><td>'+safe(x.ip)+'</td><td>'+safe(x.ok)+'</td></tr>').join('')+'</table>';}
 async function newToken(){const r=await api('/admin/api/tokens','POST',{name:document.getElementById('tname').value,expires_days:parseInt(document.getElementById('texp').value||'365')});document.getElementById('newtok').textContent=r.token?('COPY NOW — shown once: '+r.token):(r.error||'Failed');if(r.token)show();}
-async function revoke(id){await api('/admin/api/tokens/'+id+'/revoke','POST',{});show();}
-fetch('/admin/api/status').then(r=>r.json()).then(s=>{if(s.authenticated)show();if(!s.pin_set)document.getElementById('msg').textContent='Admin PIN is not set yet. The owner must set it with the setup command on the VPS (see private deploy runbook).';});
+async function revoke(id){if(!confirm('Revoke this token and its linked connections?'))return;await api('/admin/api/tokens/'+id+'/revoke','POST',{});show();}
+api('/admin/api/status','GET').then(s=>{if(s.authenticated)show();if(!s.pin_set)document.getElementById('msg').textContent='Admin PIN is not set yet. The owner must set it with the setup command on the VPS (see private deploy runbook).';});
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+        super().end_headers()
+
     def log_message(self, *a):
         pass
     def _ip(self):
@@ -800,7 +819,7 @@ class Handler(BaseHTTPRequestHandler):
             return send_json(self, 200, {"issuer": BASE_URL, "authorization_endpoint": BASE_URL + "/oauth/authorize",
                                          "token_endpoint": BASE_URL + "/oauth/token", "registration_endpoint": BASE_URL + "/oauth/register",
                                          "response_types_supported": ["code"], "grant_types_supported": ["authorization_code", "refresh_token"],
-                                         "code_challenge_methods_supported": ["S256", "plain"]})
+                                         "code_challenge_methods_supported": ["S256"]})
         if path == "/admin":
             return send_html(self, 200, ADMIN_HTML)
         if path == "/admin/api/status":
@@ -828,7 +847,9 @@ class Handler(BaseHTTPRequestHandler):
             state = qs.get("state", [""])[0]
             chall = qs.get("code_challenge", [""])[0]
             method = qs.get("code_challenge_method", ["plain"])[0]
-            form = f"""<!doctype html><html><body><h1>Crush Momo MCP — Approve</h1>
+            if not valid_authorization(cid, redir, chall, method):
+                return send_json(self, 400, {"error": "invalid_request"})
+            form = f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Crush Momo authorization</title></head><body><h1>Crush Momo MCP — Approve</h1>
             <p>This grants a short-lived read-only MCP token to the requesting app. It never grants WordPress admin access. Enter the admin PIN <b>or</b> an admin token from /admin — either one alone is enough.</p>
             <form method="post" action="/oauth/authorize">
             <input type="hidden" name="client_id" value="{html.escape(cid)}">
@@ -836,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
             <input type="hidden" name="state" value="{html.escape(state)}">
             <input type="hidden" name="code_challenge" value="{html.escape(chall)}">
             <input type="hidden" name="code_challenge_method" value="{html.escape(method)}">
-            <input type="password" name="pin" placeholder="Admin PIN or admin token" required>
+            <label for="credential">Admin token or PIN</label><input id="credential" type="password" autocomplete="off" name="pin" placeholder="Admin PIN or admin token" required>
             <button type="submit">Approve (read-only)</button></form></body></html>"""
             return send_html(self, 200, form)
         return send_json(self, 404, {"error": "not found"})
@@ -844,13 +865,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return send_json(self, 400, {"error": "invalid content length"})
+        if length < 0 or length > MAX_BODY:
+            self.close_connection = True
+            return send_json(self, 413, {"error": "body too large"})
         raw = self.rfile.read(length) if 0 < length <= MAX_BODY else b""
         ip = self._ip()
         # ---- admin API
         if path == "/admin/api/login":
             try:
                 body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("object required")
             except Exception:
                 return send_json(self, 400, {"error": "bad json"})
             if login_locked(ip):
@@ -869,12 +899,20 @@ class Handler(BaseHTTPRequestHandler):
                 db.commit()
             return send_json(self, 200, {"ok": True}, {"Set-Cookie": f"cmcp_session={sess}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=7200"})
         if path == "/admin/api/logout":
+            match = re.search(r"(?:^|;\s*)cmcp_session=([A-Za-z0-9_\-]+)", self.headers.get("Cookie") or "")
+            if match:
+                with _lock:
+                    db = state_db()
+                    db.execute("DELETE FROM sessions WHERE session_hash=?", (sha256_hex(match.group(1)),))
+                    db.commit()
             return send_json(self, 200, {"ok": True}, {"Set-Cookie": "cmcp_session=; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0"})
         if path == "/admin/api/tokens":
             if not session_ok(self):
                 return send_json(self, 401, {"error": "unauthorized"})
             try:
                 body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("object required")
             except Exception:
                 return send_json(self, 400, {"error": "bad json"})
             name = str(body.get("name", "")).strip()[:80] or "unnamed"
@@ -900,10 +938,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/oauth/register":
             try:
                 body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("object required")
             except Exception:
-                body = {}
+                return send_json(self, 400, {"error": "invalid_client_metadata"})
             cid = "cmcp_" + secrets.token_hex(12)
-            redirs = body.get("redirect_uris") or []
+            redirs = body.get("redirect_uris")
+            try:
+                redirs_ok = isinstance(redirs, list) and 1 <= len(redirs) <= 10 and not any(
+                    not isinstance(u, str) or len(u) > 2048 or not re.fullmatch(r"https://[^\s#]+", u)
+                    or not urlparse(u).hostname or urlparse(u).username is not None for u in redirs)
+            except ValueError:
+                redirs_ok = False
+            if not redirs_ok:
+                return send_json(self, 400, {"error": "invalid_redirect_uri"})
             with _lock:
                 db = state_db()
                 db.execute("INSERT INTO oauth_clients VALUES (?,?,?)", (cid, json.dumps(redirs), datetime.now(timezone.utc).isoformat()))
@@ -917,6 +965,8 @@ class Handler(BaseHTTPRequestHandler):
             state = form.get("state", [""])[0]
             chall = form.get("code_challenge", [""])[0]
             method = form.get("code_challenge_method", ["plain"])[0]
+            if not valid_authorization(cid, redir, chall, method):
+                return send_json(self, 400, {"error": "invalid_request"})
             if login_locked(ip):
                 return send_json(self, 429, {"error": "too many failed logins"})
             # v1.0.2 token-only: the same field accepts the admin PIN OR a
@@ -945,7 +995,7 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute("INSERT OR REPLACE INTO oauth_code_links VALUES (?,?)", (sha256_hex(code), admin_token_id))
                 db.commit()
             sep = "&" if "?" in redir else "?"
-            loc = f"{redir}{sep}code={code}" + (f"&state={state}" if state else "")
+            loc = redir + sep + urlencode({"code": code, **({"state": state} if state else {})})
             self.send_response(302)
             self.send_header("Location", loc)
             self.send_header("Content-Length", "0")
@@ -973,26 +1023,29 @@ class Handler(BaseHTTPRequestHandler):
                 # code was deleted, then the token INSERT crashed).
                 # Diagnostic only: log match booleans, never code/verifier.
                 _redir_ok = bool(row and row[1].rstrip("/") == redir.rstrip("/"))
+                _client_ok = bool(row and row[0] == form.get("client_id", [""])[0])
                 _exp_ok = bool(row and datetime.now(timezone.utc).isoformat() <= row[4])
-                _pkce_ok = True
-                if row and row[2]:
+                _pkce_ok = bool(row and row[2] and re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", verifier))
+                if _pkce_ok:
                     if row[3] == "S256":
                         _pkce_ok = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=") == row[2]
                     else:
                         _pkce_ok = verifier == row[2]
-                if not row or not _redir_ok or not _exp_ok or not _pkce_ok:
-                    print(f"oauth invalid_grant: found={bool(row)} redir_ok={_redir_ok} exp_ok={_exp_ok} pkce_ok={_pkce_ok} method={row[3] if row else ''}", flush=True)
+                if not row or not _client_ok or not _redir_ok or not _exp_ok or not _pkce_ok:
+                    print(f"oauth invalid_grant: found={bool(row)} client_ok={_client_ok} redir_ok={_redir_ok} exp_ok={_exp_ok} pkce_ok={_pkce_ok}", flush=True)
                     return send_json(self, 400, {"error": "invalid_grant"})
                 access = secrets.token_urlsafe(32)
                 refresh = secrets.token_urlsafe(32)
                 now = datetime.now(timezone.utc)
                 try:
-                    with _lock:
+                    with _lock, state_db():
                         db = state_db()
+                        # Recheck and consume under the same lock as issuance to prevent code replay.
+                        if not db.execute("SELECT 1 FROM oauth_codes WHERE code_hash=?", (sha256_hex(code),)).fetchone() or not linked_token_active(db, link):
+                            return send_json(self, 400, {"error": "invalid_grant"})
                         db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?,?)", (sha256_hex(access), "access", row[0], (now + timedelta(hours=1)).isoformat(), 0))
                         db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?,?)", (sha256_hex(refresh), "refresh", row[0], (now + timedelta(days=30)).isoformat(), 0))
-                        if link:
-                            db.execute("INSERT OR REPLACE INTO oauth_links VALUES (?,?)", (row[0], link[0]))
+                        db.executemany("INSERT INTO oauth_links VALUES (?,?)", [(sha256_hex(t), link[0] if link else None) for t in (access, refresh)])
                         db.execute("DELETE FROM oauth_codes WHERE code_hash=?", (sha256_hex(code),))
                         db.execute("DELETE FROM oauth_code_links WHERE code_hash=?", (sha256_hex(code),))
                         db.commit()
@@ -1004,12 +1057,16 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     db = state_db()
                     row = db.execute("SELECT client_id, expires_at, revoked FROM oauth_tokens WHERE token_hash=? AND kind='refresh'", (sha256_hex(ref),)).fetchone()
-                if not row or row[2] or datetime.now(timezone.utc).isoformat() > row[1]:
+                    link = oauth_link(db, sha256_hex(ref), row[0]) if row else None
+                    active = linked_token_active(db, link)
+                if not row or row[0] != form.get("client_id", [""])[0] or not active or row[2] or datetime.now(timezone.utc).isoformat() > row[1]:
                     return send_json(self, 400, {"error": "invalid_grant"})
                 access = secrets.token_urlsafe(32)
                 with _lock:
                     db = state_db()
                     db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?,?)", (sha256_hex(access), "access", row[0], (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), 0))
+                    if link:
+                        db.execute("INSERT INTO oauth_links VALUES (?,?)", (sha256_hex(access), link[0]))
                     db.commit()
                 return send_json(self, 200, {"access_token": access, "token_type": "Bearer", "expires_in": 3600, "scope": "read"})
             return send_json(self, 400, {"error": "unsupported_grant_type"})
@@ -1017,6 +1074,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/mcp":
             try:
                 body = json.loads(raw or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("object required")
             except Exception:
                 return send_json(self, 400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
             method = body.get("method", "")
@@ -1050,7 +1109,7 @@ class Handler(BaseHTTPRequestHandler):
                 name = params.get("name", "")
                 args = params.get("arguments") or {}
                 if name not in TOOL_FUNCS:
-                    log_call(auth[1], "tools/call:" + str(name)[:60], args, 0, ip, False, "unknown tool")
+                    log_call(auth[1], "unknown tool", args, 0, ip, False, "unknown tool")
                     return send_json(self, 200, {"jsonrpc": "2.0", "id": req_id, "result": {
                         "content": [{"type": "text", "text": json.dumps({"error": "unknown tool: no such tool exists (allowlist only)"})}], "isError": True}})
                 try:
@@ -1068,6 +1127,9 @@ class Handler(BaseHTTPRequestHandler):
                         "content": [{"type": "text", "text": json.dumps({"error": str(e)})}], "isError": True}})
             return send_json(self, 200, {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "method not found"}})
         return send_json(self, 404, {"error": "not found"})
+
+    def do_HEAD(self):
+        self.do_GET()
 
     def do_PUT(self):
         return send_json(self, 405, {"error": "method not allowed"})
