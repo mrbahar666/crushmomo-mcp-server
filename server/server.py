@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 SERVER_NAME = "crushmomo-mcp"
 PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 DHAKA = timezone(timedelta(hours=6))
@@ -171,6 +171,13 @@ def state_db():
         _db.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens
             (token_hash TEXT PRIMARY KEY, kind TEXT, client_id TEXT,
              expires_at TEXT, revoked INTEGER DEFAULT 0)""")
+        # v1.0.2: token-only authorize linkage. If an OAuth code was approved
+        # with an admin token (not the PIN), the issued OAuth tokens are linked
+        # to that admin token, so revoking the admin token also kills them.
+        _db.execute("""CREATE TABLE IF NOT EXISTS oauth_code_links
+            (code_hash TEXT PRIMARY KEY, admin_token_id INTEGER)""")
+        _db.execute("""CREATE TABLE IF NOT EXISTS oauth_links
+            (client_id TEXT PRIMARY KEY, admin_token_id INTEGER)""")
         _db.execute("""CREATE TABLE IF NOT EXISTS admin
             (key TEXT PRIMARY KEY, value TEXT)""")
         _db.execute("""CREATE TABLE IF NOT EXISTS sessions
@@ -217,6 +224,13 @@ def verify_bearer(token):
                 return None
             if row[2] and datetime.now(timezone.utc).isoformat() > row[2]:
                 return None
+            # v1.0.2: if this OAuth client was approved with an admin token,
+            # a revoked/expired admin token also kills the OAuth tokens.
+            link = db.execute("SELECT admin_token_id FROM oauth_links WHERE client_id=?", (row[1],)).fetchone()
+            if link:
+                trow = db.execute("SELECT expires_at, revoked FROM tokens WHERE id=?", (link[0],)).fetchone()
+                if not trow or trow[1] or (trow[0] and datetime.now(timezone.utc).isoformat() > trow[0]):
+                    return None
             return ("oauth", "oauth:" + row[1])
     return None
 
@@ -814,15 +828,15 @@ class Handler(BaseHTTPRequestHandler):
             state = qs.get("state", [""])[0]
             chall = qs.get("code_challenge", [""])[0]
             method = qs.get("code_challenge_method", ["plain"])[0]
-            form = f"""<!doctype html><html><body><h1>Crush Momo MCP — PIN login</h1>
-            <p>This grants a short-lived read-only MCP token to the requesting app. It never grants WordPress admin access.</p>
+            form = f"""<!doctype html><html><body><h1>Crush Momo MCP — Approve</h1>
+            <p>This grants a short-lived read-only MCP token to the requesting app. It never grants WordPress admin access. Enter the admin PIN <b>or</b> an admin token from /admin — either one alone is enough.</p>
             <form method="post" action="/oauth/authorize">
             <input type="hidden" name="client_id" value="{html.escape(cid)}">
             <input type="hidden" name="redirect_uri" value="{html.escape(redir)}">
             <input type="hidden" name="state" value="{html.escape(state)}">
             <input type="hidden" name="code_challenge" value="{html.escape(chall)}">
             <input type="hidden" name="code_challenge_method" value="{html.escape(method)}">
-            <input type="password" name="pin" placeholder="Admin PIN" required>
+            <input type="password" name="pin" placeholder="Admin PIN or admin token" required>
             <button type="submit">Approve (read-only)</button></form></body></html>"""
             return send_html(self, 200, form)
         return send_json(self, 404, {"error": "not found"})
@@ -905,18 +919,30 @@ class Handler(BaseHTTPRequestHandler):
             method = form.get("code_challenge_method", ["plain"])[0]
             if login_locked(ip):
                 return send_json(self, 429, {"error": "too many failed logins"})
+            # v1.0.2 token-only: the same field accepts the admin PIN OR a
+            # valid, unrevoked, unexpired admin token from /admin.
+            pin_ok = False
+            admin_token_id = None
             with _lock:
                 db = state_db()
                 row = db.execute("SELECT value FROM admin WHERE key='pin_hash'").fetchone()
-            if not row or not check_pin(pin, row[0]) or not redir:
+                if row and check_pin(pin, row[0]):
+                    pin_ok = True
+                else:
+                    trow = db.execute("SELECT id, expires_at, revoked FROM tokens WHERE token_hash=?", (sha256_hex(pin),)).fetchone()
+                    if trow and not trow[2] and (not trow[1] or datetime.now(timezone.utc).isoformat() <= trow[1]):
+                        admin_token_id = trow[0]
+            if (not pin_ok and admin_token_id is None) or not redir:
                 record_failed_login(ip)
-                return send_html(self, 401, "<h1>Login failed</h1><p>Wrong PIN or missing redirect.</p>")
+                return send_html(self, 401, "<h1>Login failed</h1><p>Wrong PIN/token or missing redirect.</p>")
             clear_failed_login(ip)
             code = secrets.token_urlsafe(32)
             with _lock:
                 db = state_db()
                 db.execute("INSERT INTO oauth_codes VALUES (?,?,?,?,?,?)",
                            (sha256_hex(code), cid, redir, chall, method, (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()))
+                if admin_token_id is not None:
+                    db.execute("INSERT OR REPLACE INTO oauth_code_links VALUES (?,?)", (sha256_hex(code), admin_token_id))
                 db.commit()
             sep = "&" if "?" in redir else "?"
             loc = f"{redir}{sep}code={code}" + (f"&state={state}" if state else "")
@@ -926,7 +952,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/oauth/token":
-            form = parse_qs(raw.decode(errors="ignore"))
+            # v1.0.2: accept form-encoded (OAuth spec) AND JSON bodies, so a
+            # client that posts JSON does not get "unsupported_grant_type".
+            try:
+                _jb = json.loads(raw.decode(errors="ignore") or "{}")
+                form = {k: [str(v)] for k, v in _jb.items()} if isinstance(_jb, dict) and _jb else parse_qs(raw.decode(errors="ignore"))
+            except Exception:
+                form = parse_qs(raw.decode(errors="ignore"))
             grant = form.get("grant_type", [""])[0]
             if grant == "authorization_code":
                 code = form.get("code", [""])[0]
@@ -935,26 +967,37 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     db = state_db()
                     row = db.execute("SELECT client_id, redirect_uri, challenge, challenge_method, expires_at FROM oauth_codes WHERE code_hash=?", (sha256_hex(code),)).fetchone()
-                    if row:
-                        db.execute("DELETE FROM oauth_codes WHERE code_hash=?", (sha256_hex(code),))
-                        db.commit()
-                if not row or row[1] != redir or datetime.now(timezone.utc).isoformat() > row[4]:
-                    return send_json(self, 400, {"error": "invalid_grant"})
-                if row[2]:
+                    link = db.execute("SELECT admin_token_id FROM oauth_code_links WHERE code_hash=?", (sha256_hex(code),)).fetchone() if row else None
+                # Validate BEFORE burning the code; a server-side insert
+                # failure must not destroy a valid code (v1.0.1 bug: the
+                # code was deleted, then the token INSERT crashed).
+                # Diagnostic only: log match booleans, never code/verifier.
+                _redir_ok = bool(row and row[1].rstrip("/") == redir.rstrip("/"))
+                _exp_ok = bool(row and datetime.now(timezone.utc).isoformat() <= row[4])
+                _pkce_ok = True
+                if row and row[2]:
                     if row[3] == "S256":
-                        chal = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-                        if chal != row[2]:
-                            return send_json(self, 400, {"error": "invalid_grant"})
-                    elif verifier != row[2]:
-                        return send_json(self, 400, {"error": "invalid_grant"})
+                        _pkce_ok = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=") == row[2]
+                    else:
+                        _pkce_ok = verifier == row[2]
+                if not row or not _redir_ok or not _exp_ok or not _pkce_ok:
+                    print(f"oauth invalid_grant: found={bool(row)} redir_ok={_redir_ok} exp_ok={_exp_ok} pkce_ok={_pkce_ok} method={row[3] if row else ''}", flush=True)
+                    return send_json(self, 400, {"error": "invalid_grant"})
                 access = secrets.token_urlsafe(32)
                 refresh = secrets.token_urlsafe(32)
                 now = datetime.now(timezone.utc)
-                with _lock:
-                    db = state_db()
-                    db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?)", (sha256_hex(access), "access", row[0], (now + timedelta(hours=1)).isoformat(), 0))
-                    db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?)", (sha256_hex(refresh), "refresh", row[0], (now + timedelta(days=30)).isoformat(), 0))
-                    db.commit()
+                try:
+                    with _lock:
+                        db = state_db()
+                        db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?,?)", (sha256_hex(access), "access", row[0], (now + timedelta(hours=1)).isoformat(), 0))
+                        db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?,?)", (sha256_hex(refresh), "refresh", row[0], (now + timedelta(days=30)).isoformat(), 0))
+                        if link:
+                            db.execute("INSERT OR REPLACE INTO oauth_links VALUES (?,?)", (row[0], link[0]))
+                        db.execute("DELETE FROM oauth_codes WHERE code_hash=?", (sha256_hex(code),))
+                        db.execute("DELETE FROM oauth_code_links WHERE code_hash=?", (sha256_hex(code),))
+                        db.commit()
+                except Exception:
+                    return send_json(self, 500, {"error": "server_error"})
                 return send_json(self, 200, {"access_token": access, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh, "scope": "read"})
             if grant == "refresh_token":
                 ref = form.get("refresh_token", [""])[0]
@@ -966,7 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
                 access = secrets.token_urlsafe(32)
                 with _lock:
                     db = state_db()
-                    db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?)", (sha256_hex(access), "access", row[0], (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), 0))
+                    db.execute("INSERT INTO oauth_tokens VALUES (?,?,?,?,?)", (sha256_hex(access), "access", row[0], (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), 0))
                     db.commit()
                 return send_json(self, 200, {"access_token": access, "token_type": "Bearer", "expires_in": 3600, "scope": "read"})
             return send_json(self, 400, {"error": "unsupported_grant_type"})

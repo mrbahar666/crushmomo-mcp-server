@@ -46,7 +46,14 @@ codex mcp list
 ```
 Or: `codex mcp add crushmomo-mcp --url https://mcp.crushmomo.com/mcp` and follow its login/token prompt.
 
-## ChatGPT (OAuth / PIN — Bearer alone does NOT work here)
+## ChatGPT (OAuth — token-only from v1.0.2; Bearer alone does NOT work in the Plugins UI)
+
+v1.0.1 bug, fixed in v1.0.2 (locally tested, see below): the OAuth token
+INSERT used 4 placeholders for a 5-column table, so token issuance always
+crashed, the code was already deleted, and ChatGPT showed
+"authorization is invalid or has expired". v1.0.2 fixes the placeholders,
+validates before burning the code, accepts JSON token bodies as well as
+form bodies, and lets the approve page accept an admin token instead of a PIN.
 
 1. In ChatGPT web: Settings → Apps & Connectors → enable Developer mode (paid plans; on
    Business/Enterprise an admin may need to allow custom connectors first).
@@ -54,16 +61,33 @@ Or: `codex mcp add crushmomo-mcp --url https://mcp.crushmomo.com/mcp` and follow
    authentication **OAuth**.
 3. ChatGPT discovers the OAuth metadata from the server
    (`/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server`).
-   It registers itself, then opens the server's PIN login page
+   It registers itself, then opens the server's approve page
    (`https://mcp.crushmomo.com/oauth/authorize`).
-4. The owner enters the admin PIN (the same PIN as the admin panel) and approves.
-   ChatGPT receives a short-lived access token (1 hour) plus a refresh token (30 days).
-   No Bearer token is pasted by hand in this flow.
+4. The owner enters the admin PIN **or** an admin token from /admin — either
+   one alone is enough. ChatGPT receives a short-lived access token (1 hour)
+   plus a refresh token (30 days). If the approve used a token, revoking that
+   admin token also revokes the OAuth tokens issued from it.
+   No Bearer token is pasted into the ChatGPT dialog itself.
 5. Add the connector to a chat and test with `ping`.
-Honest limit: ChatGPT's connector UI and plan rules change often, and this flow
-cannot be fully verified from a headless VM. If ChatGPT rejects the connector,
-check (a) Developer mode is on, (b) the URL is exactly the one above,
-(c) the PIN login page loads, and (d) refresh the connector's tools in its settings.
+
+### ChatGPT plugin ZIP upload (alternative to the MCP URL dialog)
+
+Upload `plugin/crushmomo-mcp.zip` from this repo in ChatGPT → Plugins →
+New Plugin (drag-and-drop, .zip). The ZIP contains exactly one plugin root:
+`plugin.json` + `mcp.json` (remote server `https://mcp.crushmomo.com/mcp`)
++ `skills/crushmomo/SKILL.md`. No token, PIN, or secret is in the ZIP.
+After upload, connect it the same way as above (approve with PIN or token).
+Public directory publishing additionally needs OpenAI Platform verification
+and review — the ZIP upload in your own Plugins page is not a public listing.
+
+### GitHub URL install (Dots / local agents only)
+
+Normal ChatGPT chat cannot install from a GitHub URL in chat — it cannot
+change its own Settings. A local agent (Dots with its computer online,
+Claude Code, Codex, Muse) can: see `plugin/README.md`. In short: clone
+`https://github.com/mrbahar666/crushmomo-mcp-server`, set
+`CRUSHMOMO_MCP_TOKEN` from /admin in the agent's own config (never in chat),
+run `clients/stdio-wrapper.py` or use HTTP with a Bearer header, test `ping`.
 
 ## Groq (agent code — there is no Groq chat MCP button)
 
