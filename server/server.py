@@ -261,7 +261,8 @@ def db_named(sql, columns):
         row = {}
         for i, col in enumerate(columns):
             v = parts[i] if i < len(parts) else None
-            if v in (None, "\\N", ""):
+            # mysql --batch prints SQL NULL as the literal string "NULL", not \N.
+            if v in (None, "\\N", "NULL", ""):
                 v = None
             row[col] = v
         out.append(row)
@@ -516,7 +517,7 @@ def tool_products_list(a):
     if in_stock:
         where.append("m.stock_status='instock'")
     rows = db_named(
-        f"SELECT p.ID, p.post_title, p.post_excerpt, m.sku, m.min_price, m.max_price, m.stock_quantity, m.stock_status, m.total_sales "
+        f"SELECT p.ID, REPLACE(REPLACE(REPLACE(p.post_title,CHAR(9),' '),CHAR(10),' '),CHAR(13),' '), LEFT(REPLACE(REPLACE(REPLACE(p.post_excerpt,CHAR(9),' '),CHAR(10),' '),CHAR(13),' '),300), m.sku, m.min_price, m.max_price, m.stock_quantity, m.stock_status, m.total_sales "
         f"FROM {DB_NAME}.{p} p LEFT JOIN {DB_NAME}.{m} m ON m.product_id=p.ID WHERE {' AND '.join(where)} ORDER BY p.post_title LIMIT {limit};",
         ["product_id", "name", "excerpt", "sku", "price_min", "price_max", "stock_quantity", "stock_status", "total_sales"])
     out = []
@@ -537,7 +538,7 @@ def tool_product_detail(a):
         return {**MOCK_PRODUCT, "short_description": "Mock product for testing and docs only.", "note": "MOCK DATA ONLY."}
     p, m = f"{DB_PREFIX}posts", f"{DB_PREFIX}wc_product_meta_lookup"
     rows = db_named(
-        f"SELECT p.ID, p.post_title, p.post_excerpt, m.sku, m.min_price, m.max_price, m.stock_quantity, m.stock_status, m.total_sales, m.onsale "
+        f"SELECT p.ID, REPLACE(REPLACE(REPLACE(p.post_title,CHAR(9),' '),CHAR(10),' '),CHAR(13),' '), LEFT(REPLACE(REPLACE(REPLACE(p.post_excerpt,CHAR(9),' '),CHAR(10),' '),CHAR(13),' '),1000), m.sku, m.min_price, m.max_price, m.stock_quantity, m.stock_status, m.total_sales, m.onsale "
         f"FROM {DB_NAME}.{p} p LEFT JOIN {DB_NAME}.{m} m ON m.product_id=p.ID WHERE p.ID={pid} AND p.post_type='product' LIMIT 1;",
         ["product_id", "name", "excerpt", "sku", "price_min", "price_max", "stock_quantity", "stock_status", "total_sales", "onsale"])
     if not rows:
